@@ -6,6 +6,7 @@
 #
 import sys
 from pyparsing import *
+#sys.setrecursionlimit(10000)
 
 ParserElement.enablePackrat()
 
@@ -38,7 +39,7 @@ table_alias = identifier.copy()
 index_name = identifier.copy()
 function_name = identifier.copy()
 parameter_name = identifier.copy()
-database_name = identifier.copy()
+schema_name = identifier.copy()
 
 comment = "--" + restOfLine
 
@@ -64,15 +65,22 @@ type_name = oneOf("TEXT REAL INTEGER BLOB NULL")
 
 expr_term = (
     CAST + LPAR + expr + AS + type_name + RPAR
-    | EXISTS + LPAR + select_stmt + RPAR
-    | function_name.setName("function_name")
+#ply ajout CASE
+    | Group(CASE + Optional(expr) + WHEN + expr + Optional(THEN + expr) + Optional(ELSE + expr) + END)
+#    | EXISTS + LPAR + select_stmt + RPAR
+    | EXISTS + LPAR + identifier + RPAR
+#ply ajout scalar    | LPAR + select_stmt + RPAR 
+    | Group(
+    function_name.setName("function_name")
+#ply    function_name
     + LPAR
-    + Optional(STAR | delimitedList(expr))
+    + Optional(STAR | Optional(DISTINCT) + delimitedList(expr))
     + RPAR
+    )
     | literal_value
     | bind_parameter
     | Group(
-        identifier("col_db") + DOT + identifier("col_tab") + DOT + identifier("col")
+        identifier("col_sch") + DOT + identifier("col_tab") + DOT + identifier("col")
     )
     | Group(identifier("col_tab") + DOT + identifier("col"))
     | Group(identifier("col"))
@@ -115,7 +123,8 @@ expr << infixNotation(
         ),
         ((BETWEEN | NOT_BETWEEN, AND), TERNARY, opAssoc.LEFT),
         (
-            (IN | NOT_IN) + LPAR + Group(select_stmt | delimitedList(expr)) + RPAR,
+#            (IN | NOT_IN) + LPAR + Group(select_stmt | delimitedList(expr)) + RPAR,
+            (IN | NOT_IN) + LPAR + Group(identifier | delimitedList(expr)) + RPAR,
             UNARY,
             opAssoc.LEFT,
         ),
@@ -127,7 +136,8 @@ expr << infixNotation(
 compound_operator = UNION + Optional(ALL) | INTERSECT | EXCEPT
 
 ordering_term = Group(
-    expr("order_key")
+   expr("order_key")
+#ply?    expr_term("order_key")
     + Optional(COLLATE + collation_name("collate"))
     + Optional(ASC | DESC)("direction")
 )
@@ -138,14 +148,15 @@ join_constraint = Group(
 
 join_op = COMMA | Group(
     Optional(NATURAL) + Optional(INNER | CROSS | LEFT + OUTER | LEFT | OUTER) + JOIN
-)
+)("join_op")
 
 join_source = Forward()
 single_source = (
-    Group(database_name("database") + DOT + table_name("table*") | table_name("table*"))
-    + Optional(Optional(AS) + table_alias("table_alias*"))
-    + Optional(INDEXED + BY + index_name("name") | NOT + INDEXED)("index")
-    | (LPAR + select_stmt + RPAR + Optional(Optional(AS) + table_alias))
+    Group(schema_name("schema") + DOT + table_name("table") + Optional(Optional(AS) + table_alias("table_alias")) )
+    | Group( table_name("table")+ Optional(Optional(AS) + table_alias("table_alias")) )
+#    + Optional(Optional(AS) + table_alias("table_alias"))
+#    + Optional(INDEXED + BY + index_name("name") | NOT + INDEXED)("index")
+#    | Group(LPAR + select_stmt + RPAR + Optional(Optional(AS) + table_alias("table_alias")))
     | (LPAR + join_source + RPAR)
 )
 
@@ -158,14 +169,15 @@ join_source <<= (
 result_column = Group(
     STAR("col")
     | table_name("col_table") + DOT + STAR("col")
-    | expr("col") + Optional(Optional(AS) + column_alias("alias"))
+    | expr("proj_col") + Optional(Optional(AS) + column_alias("alias"))
+#ply    | expr("col") + Optional(Optional(AS) + column_alias("alias"))
 )
 
 select_core = (
     SELECT
     + Optional(DISTINCT | ALL)
-    + Group(delimitedList(result_column))("columns")
-    + Optional(FROM + join_source("from*"))
+    + Group(delimitedList(result_column))("projections")
+    + Optional(FROM + join_source("from"))
     + Optional(WHERE + expr("where_expr"))
     + Optional(
         GROUP
@@ -190,46 +202,56 @@ select_stmt.ignore(comment)
 
 def main():
     tests = """\
-        select * from xyzzy where z > 100
-        select * from xyzzy where z > 100 order by zz
-        select * from xyzzy
-        select z.* from xyzzy
-        select a, b from test_table where 1=1 and b='yes'
-        select a, b from test_table where 1=1 and b in (select bb from foo)
-        select z.a, b from test_table where 1=1 and b in (select bb from foo)
-        select z.a, b from test_table where 1=1 and b in (select bb from foo) order by b,c desc,d
-        select z.a, b from test_table left join test2_table where 1=1 and b in (select bb from foo)
-        select a, db.table.b as BBB from db.table where 1=1 and BBB='yes'
-        select a, db.table.b as BBB from test_table,db.table where 1=1 and BBB='yes'
-        select a, db.table.b as BBB from test_table,db.table where 1=1 and BBB='yes' limit 50
-        select a, b from test_table where (1=1 or 2=3) and b='yes' group by zx having b=2 order by 1
-        SELECT emp.ename as e FROM scott.employee as emp
-        SELECT ename as e, fname as f FROM scott.employee as emp
-        SELECT emp.eid, fname,lname FROM scott.employee as emp
-        SELECT ename, lname, emp.eid FROM scott.employee as emp
-        select emp.salary * (1.0 + emp.bonus) as salary_plus_bonus from scott.employee as emp
-        SELECT * FROM abcd WHERE (ST_Overlaps("GEOM", 'POINT(0 0)'))
-        SELECT * FROM abcd WHERE CAST(foo AS REAL) > -999.123
-        SELECT * FROM abcd WHERE bar BETWEEN +180 AND +10E9
-        SELECT * FROM abcd WHERE CAST(foo AS REAL) < (4 + -9.876E-4)
-        SELECT SomeFunc(99)
-        SELECT * FROM abcd WHERE ST_X(ST_Centroid(geom)) BETWEEN (-180*2) AND (180*2)
-        SELECT * FROM abcd WHERE a
-        SELECT * FROM abcd WHERE snowy_things REGEXP '[⛄️☃️☃🎿🏂🌨❄️⛷🏔🗻❄︎❆❅]'
-        SELECT * FROM abcd WHERE a."b" IN 4
-        SELECT * FROM abcd WHERE a."b" In ('4')
-        SELECT * FROM "a".b AS "E" WHERE "E"."C" >= CURRENT_Time
-        SELECT * FROM abcd WHERE "dave" != "Dave" -- names & things ☃️
-        SELECT * FROM a WHERE a.dave is not null
-        SELECT * FROM abcd WHERE pete == FALSE or peter is true
-        SELECT * FROM abcd WHERE a >= 10 * (2 + 3)
-        SELECT * FROM abcd WHERE frank = 'is ''scary'''
-        SELECT * FROM abcd WHERE "identifier with ""quotes"" and a trailing space " IS NOT FALSE
-        SELECT * FROM abcd WHERE blobby == x'C0FFEE'  -- hex
-        SELECT * FROM abcd WHERE ff NOT IN (1,2,4,5)
-        SELECT * FROM abcd WHERE ff not between 3 and 9
-        SELECT * FROM abcd WHERE ff not like 'bob%'
-    """
+#        select case when a=2 then 1 else 2 end as x from T
+#        select case a when 2 then 1 else 2 end as x from T
+#        select case a when 2 else 2 end as x from T
+#        select case a when 2 then 1 end as x from T
+#        select case a when 2 then 1 end || 'bb' from T
+#        select case a when 2 then 1 end from T
+#        select nvl(t.a,5)-2 as x, t.c+2 y from tt t where nvl(a,5) > 2
+#        select trunc(nvl(t.a,5)-2,'TT','Z') as x, t.c+2 y from tt t where nvl(a,5) > 2
+#        select ta.a+1,tb.A,count(*) from tt ta,tt tb where ta.id*6=tb.id/9 and ta.z=tb.z group by  ta.a+1,tb.A
+#        select count(distinct t.o) from kjhg t
+#        select t.* from kjhg t
+#        select distinct t.o from kjhg t
+#        select sysdate, sysdate() from t,u
+#        select * from hgst ta inner join jhyy tb on (ta.c1=tb.c2) where ta.c3=2
+#        select * from hgst ta, jhyy tb where ta.c1=tb.c2 and  ta.c3=2
+
+# RULES:
+#  no subquery (voir dans RevJ le nommage lien)
+#  table alias mandatory or alias = table_name for colum prefix
+# ? ANSI join only (SQLeo can translate other joins)
+
+#SIMPLE select (1 table / no join)
+        select tab.a,tab.b from tab
+        select tab.a,tab.b from TAB
+        select tab.a,tab.b from tab where tab.c='AA' order by 1
+        select t_alias.a,t_alias.b from tab as t_alias 
+        select t_alias_wo_as.a,t_alias_wo_as.b from tab t_alias_wo_as
+        select t.a,t.b, count(*) from nn.kjh t group by t.a,t.b
+        select t.a from nn.kjh as t where t.b in (1,2,3)
+        select t.a from nn.kjh t where t.b in (subselect_1)
+        select t.a from nn.kjh t where exists (subselect_2)
+        select t.a from nn.kjh t where true
+        select t.a from nn.kjh t where t.b between t.x and t.y
+        select nvl(t.a,5)-2 as x, t.c+2 y from tt t where nvl(t.a,5) > 2
+        
+# out       select sch.tab.a,sch.tab.b from sch.tab  
+#JOIN
+# out        select t1.a,t2.b from tab t1,tab t2 where t1.c=t2.d
+# out        select t1.a+t2.b from tab t1,tab t2 where t1.c=t2.d
+#ANSI JOIN
+        select t1.a,t2.b from tab t1 join tab t2 on (t1.c=t2.d)
+        select t1.a+t2.b from tab t1 join tab t2 on t1.c=t2.d
+        select count(t1.x) from tab t1 join tab t2 using (y)
+#INLINE VIEW / DERIVED TABLE
+        select t.a from subselect_1 t
+# ko cf convention subq        select t.a from (subselect_1) t
+        select 1
+# out        select * from (select 2 from dual) as tt 
+# out        select * from (select 2 from dual) as tt, zz d
+        """
 
     success, _ = select_stmt.runTests(tests)
     print("\n{}".format("OK" if success else "FAIL"))
